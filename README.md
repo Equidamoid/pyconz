@@ -15,7 +15,7 @@ Library supports basic protocol features:
 You will need python3 and some dependences:
 
      # of course, it's better to use virtualenv and/or packet manager
-     pip install serial sliblib zigpy
+     pip install serial sliplib zigpy
 
 There is a demo.py script that opens the connection and prints incoming data to stderr.
 
