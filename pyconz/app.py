@@ -1,5 +1,3 @@
-import zigpy.zdo
-import zigpy.zcl
 import logging
 import serial
 import serial.aio
@@ -26,6 +24,7 @@ class Message:
         self.data = None    # type: bytes
         self.profile_id = None  # type: int
         self.cluster_id = None  # type: int
+        self.request_id = None  # type: int
 
     @staticmethod
     def from_buffer(buf: Buffer):
@@ -58,20 +57,16 @@ class Message:
         return msg, dev_st
 
     def deserialize(self):
-        if self.dest.endpoint == 0:
-            deserialize = zigpy.zdo.deserialize
-        else:
-            deserialize = zigpy.zcl.deserialize
-        return deserialize(self.cluster_id, self.data)
+        return 0, 0, 0, binascii.hexlify(self.data),
 
     def __str__(self):
         tsn, cmd, reply, value = self.deserialize()
 
         if isinstance(value, bytes):
             value = binascii.hexlify(value).decode()
-        return '[%04x:%04x] %s -> %s: [%d, %d, %d, %s]' % (
+        return '[%04x:%04x] %s -> %s: [%s]' % (
             self.cluster_id, self.profile_id, self.src, self.dest,
-            tsn, cmd, reply, value)
+            binascii.hexlify(self.data).decode())
 
 
 class SerialConnection:
@@ -82,30 +77,42 @@ class SerialConnection:
         self._drv = sliplib.Driver()
         self.logger = logger
         self._msg_handlers = {
-            CommandId.DEVICE_STATE: self.handle_dev_state,
-            CommandId.DEVICE_STATE_CHANGED: self.handle_dev_state_changed,
+            CommandId.DEVICE_STATE: self._handle_dev_state,
+            CommandId.DEVICE_STATE_CHANGED: self._handle_dev_state_changed,
             # 0x1c: self.ignore_message,
-            CommandId.APS_DATA_INDICATION: self.handle_incoming_data,
-            CommandId.READ_PARAMETER: self.handle_get_parameter_response
+            CommandId.APS_DATA_INDICATION: self._handle_incoming_data,
+            CommandId.READ_PARAMETER: self._handle_get_parameter_response,
+            CommandId.WRITE_PARAMETER: self._handle_set_parameter_response,
+            CommandId.APS_DATA_REQUEST: self._handle_data_request_response,
         }
         self._requests = {}     # type: typing.Dict[int, asyncio.Future]
+        self.zigpy_futures = {}
+
+    def _handle_data_request_response(self, buf):
+        self.logger.info("APS_DATA_REQUEST result: %s", buf.status)
+
+    def eof_received(self):
+        logging.error("EOF")
 
     async def read_all_parameters(self):
         data = {}
         for p in NetworkParameter:
             data[p] = await self.get_parameter(p)
-        self.logger.warning("Parameters: %s", data)
+        self.logger.warning("Read device parameters:")
+        for i in sorted(data):
+            self.logger.warning('%s = %s', i, data[i])
+        return data
 
     def get_parameter(self, p):
         # type: (protocol.NetworkParameter) -> asyncio.Future
         ret = asyncio.Future()
-        seq = self.next_seq()
+        seq = self._next_seq()
         req = struct.pack('<BBBHHB', 0x0a, seq, 0, 8, 1, p.value)
         self._requests[seq] = ret
-        self.send_message(req)
+        self._send_command(req)
         return ret
 
-    def handle_get_parameter_response(self, buf: Buffer):
+    def _handle_get_parameter_response(self, buf: Buffer):
         seq = buf.seq
         pl_len = buf.pop_int('<H')
         param = buf.pop_enum('B', NetworkParameter)
@@ -119,7 +126,46 @@ class SerialConnection:
         except KeyError:
             pass
 
-    def next_seq(self):
+    def set_parameter(self, p, v):
+        # type: (protocol.NetworkParameter, typing.Any) -> asyncio.Future
+        p_type = param_types[p]
+        seq = self._next_seq()
+        pl = struct.pack(p_type.format, v)
+        hdr = struct.pack('<BBBHHB', protocol.CommandId.WRITE_PARAMETER.value, seq, 0, len(pl) + 8, len(pl) + 1, p.value)
+        ret = asyncio.Future()
+        self._requests[seq] = ret
+        self._send_command(hdr + pl)
+        return ret
+
+    def _handle_set_parameter_response(self, buf: Buffer):
+        seq = buf.seq
+        pl_len = buf.pop_int('<H')
+        param = buf.pop_enum('B', NetworkParameter)
+        p_type = param_types[param]     # type: protocol.NetworkParamInfo
+        data = buf.pop_int(p_type.format)
+        status = buf.status
+        self.logger.warning("Status for writing %s: %s", param, status)
+        try:
+            f = self._requests[seq]
+            if status == protocol.Status.SUCCESS:
+                f.set_result()
+            else:
+                f.set_exception(RuntimeError("Error %s" % status))
+            del self._requests[seq]
+        except KeyError:
+            pass
+
+    def set_network_state(self, state=protocol.NetworkState.CONNECTED):
+        seq = self._next_seq()
+        msg = struct.pack(
+            '<BBBHB',
+            protocol.CommandId.CHANGE_NETWORK_STATE.value,
+            seq,
+            0,
+            6, state.value)
+        self._send_command(msg)
+
+    def _next_seq(self):
         self._seq += 1
         self._seq = self._seq % 256
         if self._seq in self._requests:
@@ -137,18 +183,12 @@ class SerialConnection:
         msgs = self._drv.receive(data)
         for i in msgs:
             try:
-                self.handle_message(i)
+                self._handle_command(i)
             except:
-                self.logger.exception("Error while handling message %s", binascii.hexlify(i).decode())
+                self.logger.exception("Error while handling command %s", binascii.hexlify(i).decode())
 
     def connection_lost(self, exc):
         self.logger.error("Connection lost")
-
-    async def startup(self):
-        self.logger.warning("Beginning of startup sequence")
-        await asyncio.sleep(5)
-        await self.read_all_parameters()
-        self.logger.warning("End of startup sequence")
 
     def do_hello(self):
         self.request_dev_state()
@@ -158,8 +198,8 @@ class SerialConnection:
         os.system('gpio write 0 0; sleep 2; gpio write 0 1')
         self._drv = sliplib.Driver()
 
-    def handle_message(self, buf):
-        self.logger.info("Got message %s", binascii.hexlify(buf).decode())
+    def _handle_command(self, buf):
+        self.logger.debug("Incoming serial message %s", binascii.hexlify(buf).decode())
         if b'STARTING APP' in buf:
             self.logger.warning("Device [re]started")
             self.do_hello()
@@ -176,9 +216,9 @@ class SerialConnection:
             elif cmd.cmd in self._msg_handlers:
                 self._msg_handlers[cmd.cmd](cmd)
             else:
-                self.logger.warning("Ignoring unknown message (cmd id %02x, %s)", cmd.cmd, binascii.hexlify(buf).decode())
+                self.logger.warning("Ignoring unknown message (cmd id %s, %s)", cmd.cmd, binascii.hexlify(buf).decode())
 
-    def handle_dev_state_value(self, state):
+    def _handle_dev_state_value(self, state):
         flags = [i for i in DeviceState if (state & i.value) == i.value]
         net_state = NetworkState(state & 3)
         logger.info("Device state message: state = %d (net: %s, %s, %s)", state, net_state, bin(state), flags)
@@ -186,49 +226,78 @@ class SerialConnection:
             self.request_incoming_data()
 
     def request_dev_state(self):
-        req = struct.pack('<BBBHBBB', 0x07, self.next_seq(), 0, 8, 0, 0, 0)
-        self.send_message(req)
+        req = struct.pack('<BBBHBBB', protocol.CommandId.DEVICE_STATE.value, self._next_seq(), 0, 8, 0, 0, 0)
+        self._send_command(req)
 
-    def handle_dev_state(self, buf: Buffer):
+    def _handle_dev_state(self, buf: Buffer):
         state = buf.pop_int('B')
-        self.handle_dev_state_value(state)
+        self._handle_dev_state_value(state)
 
-    def handle_dev_state_changed(self, buf: Buffer):
+    def _handle_dev_state_changed(self, buf: Buffer):
         state = buf.pop_int('B')
-        self.handle_dev_state_value(state)
+        self._handle_dev_state_value(state)
 
-    def handle_incoming_data(self, buf: Buffer):
+    def _handle_incoming_data(self, buf: Buffer):
         if buf.status != Status.SUCCESS:
             self.logger.warning("Incoming data with status %s", buf.status)
             return
         msg, dev_st = Message.from_buffer(buf)
+        try:
+            self.handle_incoming_message(msg)
+        except:
+            self.logger.exception("Error while processing message %s", msg)
+        self._handle_dev_state_value(dev_st)
 
-        # No integration with zigpy yet, so let's just log the data
-        self.logger.warning('Data: %s', msg)
-        self.handle_dev_state_value(dev_st)
+    def handle_incoming_message(self, msg: Message):
+        self.logger.warning("Unhandled message: %s", msg)
 
     def request_incoming_data(self):
-        req_id = self.next_seq()
+        req_id = self._next_seq()
         req = struct.pack(
             '<BBBHH',
-            0x17,
+            protocol.CommandId.APS_DATA_INDICATION.value,
             req_id,
             0,
             7,
             1,
         )
-        self.send_message(req)
+        self._send_command(req)
 
-    def send_message(self, buf):
+    def _send_command(self, buf):
         self.logger.info("Sending message %s", binascii.hexlify(buf).decode())
         pack = self._drv.send(buf + crc(buf))
         self.logger.debug("Encoded message: %s", binascii.hexlify(pack).decode())
         self._transport.write(bytes([0xC0]))
         self._transport.write(pack)
 
-    def request(self, nwk, profile, cluster, src_ep, dst_ep, sequence, data, expect_reply=True, timeout=10):
-        pass
+    def send_msg(self, msg: Message):
+        assert msg.dest.mode == AddressType.NWK
+        pl = struct.pack(
+            '<BBBHBHHBH',
+            msg.request_id,
+            0,
+            0x02,  # FIXME NWK
+            msg.dest.addr,
+            msg.dest.endpoint,
+            msg.profile_id,
+            msg.cluster_id,
+            msg.src.endpoint,
+            len(msg.data)
+        )
+        pl += msg.data
+        pl += struct.pack('<BB', 0, 5)
+        buf = struct.pack(
+            '<BBBHH',
+            0x12,
+            self._next_seq(),
+            0,
+            len(pl) + 7,
+            len(pl)
+
+        )
+        self._send_command(buf + pl)
 
     def ignore_message(self, buf):
         pass
+
 
