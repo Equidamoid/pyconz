@@ -17,13 +17,14 @@ async def discover_neighbours(conn, dev):
     results_dev = []
     while True:
         try:
-            status, n_total, r_offset, r_count, data = await dev.zdo.request(0x0031, len(results))
+            status, data = await dev.zdo.request(0x0031, len(results))
         except TimeoutError:
             logger.error("ZDO request timed out, skipping device")
             return []
-        results += data
-        logger.warning("N disco: %d/%d", len(results), n_total)
-        if r_offset + r_count >= n_total:
+        neigbours = list(data.NeighborTableList)
+        results += neigbours
+        logger.warning("N disco: %d/%d", len(results), data.Entries)
+        if data.StartIndex + len(neigbours) >= data.Entries:
             break
 
     logger.warning("%d neighbours discovered for dev %s:", len(results), dev)
