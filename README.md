@@ -1,14 +1,16 @@
 ### pyconz
 
+
 [pyconz](https://github.com/Equidamoid/pyconz) is a Python implementation for the [Zigpy](https://github.com/zigpy/) project to implement [deCONZ](https://www.dresden-elektronik.de/funktechnik/products/software/pc/deconz/) based [Zigbee](https://www.zigbee.org) radio devices.
 
 This uses the deCONZ serial protocol for communicating with [ConBee](https://www.dresden-elektronik.de/conbee/) and [RaspBee](https://www.dresden-elektronik.de/raspbee/) adapters from [Dresden-Elektronik](https://github.com/dresden-elektronik/).
+
 
 #### Current status
 
 Library supports basic protocol features:
  - Getting network parameters
- - Receiving data messages (and decoding them if possible using zigpy)
+ - Receiving data messages (and decoding them if possible using zigpy).
  - In theory, sending data messages, but I can't really generate proper payload to test it yet.
 
 #### Development
